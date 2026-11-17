@@ -80,6 +80,10 @@ on:
       private-repos:
         type: string
         default: ""
+      app-owner:
+        description: "The account that owns the repos in private-repos (the App token's owner). Stays azzarabe while the libraries live there, even for a caller that has moved to the azzara-hq org; do not derive it from the caller's owner"
+        type: string
+        default: "azzarabe"
       app-port:
         type: number
         default: 3000
@@ -173,7 +177,7 @@ jobs:
         with:
           app-id: ${{ secrets.AZZARA_APP_ID }}
           private-key: ${{ secrets.AZZARA_APP_PRIVATE_KEY }}
-          owner: azzarabe
+          owner: ${{ inputs.app-owner }}
           repositories: ${{ inputs.private-repos }}
           permission-contents: read
       - name: Configure git auth for the private @azzara/* packages

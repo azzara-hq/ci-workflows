@@ -90,6 +90,10 @@ on:
         description: "Comma-separated azzarabe repos the App token may read; empty = no private packages"
         type: string
         default: ""
+      app-owner:
+        description: "The account that owns the repos in private-repos (the App token's owner). Stays azzarabe while the libraries live there, even for a caller that has moved to the azzara-hq org; do not derive it from the caller's owner"
+        type: string
+        default: "azzarabe"
       postgres:
         description: "true = a PostgreSQL 16 service, and DATABASE_URL=postgres://check:check@127.0.0.1:5432/check for the tests"
         type: boolean
@@ -170,7 +174,7 @@ jobs:
         with:
           app-id: ${{ secrets.AZZARA_APP_ID }}
           private-key: ${{ secrets.AZZARA_APP_PRIVATE_KEY }}
-          owner: azzarabe
+          owner: ${{ inputs.app-owner }}
           repositories: ${{ inputs.private-repos }}
           permission-contents: read
       - name: Configure git auth for the private @azzara/* packages
