@@ -1,0 +1,75 @@
+name: door-contracts
+
+# The ONE shared door-contract CI job (Wave 2 item 9): asserts the live
+# capability-door contracts — 401 fail-closed, 400 request validation, and
+# response envelope shapes — against the real doors (mcp.azzara.eu + HELM
+# staging). Safe by construction: no probe ever executes a core with valid
+# params except read-only config views (see contracts/test-doors.sh header).
+#
+# Reusable: app repos can gate on it via
+#   uses: azzarabe/azzara-infra/.github/workflows/door-contracts.yml@main
+#   secrets: inherit   (org secrets) — or pass the two tokens explicitly.
+#
+# Pull requests that touch contracts/ or this file run it too, so HELM's merge runner sees CI on
+# their head commit (azzara-spirit docs/runbooks/merge-gate.md, "Green checks are read from GitHub").
+# What the probes may do is stated in the test-doors.sh header (401 probes carry no credential
+# except the customer-mail services-token probe, 400 probes stop before a core runs, the only
+# 200 probes are reads); a PR runs its own copy of it.
+#
+# Runner: azzara-infra's runner on the CI box (label azzara-ci-box, row infra-box of
+# hosts/vps-azzara/owner/ci-runner.sh), owner decision 2026-10-21; GitHub-hosted runners are not used.
+# Not the control host's runner (label azzara-ci): both doors resolve to the control host's own
+# address, and that runner's namespace may not reach its own host (the in_ci chain of ci-runner.sh).
+# A workflow_call caller runs this job on ITS repository's runners: it needs one with this label.
+# jq is a pinned, sha256-checked release (the box's package list does not pin it).
+
+on:
+  push:
+    branches: [main]
+    paths: ["contracts/**", ".github/workflows/door-contracts.yml"]
+  pull_request:
+    paths: ["contracts/**", ".github/workflows/door-contracts.yml"]
+  schedule:
+    - cron: "45 5 * * *"   # daily 05:45 UTC — after the nightly E2E window
+  workflow_dispatch:
+  workflow_call:
+    secrets:
+      AZZARA_SERVICES_TOKEN:
+        required: true
+      HELM_STAGING_SERVICES_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: door-contracts
+  cancel-in-progress: false
+
+env:
+  JQ_VERSION: "1.8.2"
+  # sha256 of jq-linux-amd64 of jq-1.8.2 (2267912 bytes): the line in the release's sha256sum.txt and the
+  # asset digest in the releases API are equal (both read 2026-10-23).
+  JQ_LINUX_AMD64_SHA256: "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f"
+
+jobs:
+  contracts:
+    runs-on: [self-hosted, azzara-ci-box]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned jq
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/jq" "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64"
+          echo "${JQ_LINUX_AMD64_SHA256}  $RUNNER_TEMP/bin/jq" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/jq"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Assert live door contracts
+        env:
+          AZZARA_SERVICES_TOKEN: ${{ secrets.AZZARA_SERVICES_TOKEN }}
+          HELM_STAGING_SERVICES_TOKEN: ${{ secrets.HELM_STAGING_SERVICES_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "jq: $(command -v jq) $(jq --version)"
+          bash contracts/test-doors.sh

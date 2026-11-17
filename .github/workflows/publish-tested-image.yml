@@ -1,0 +1,150 @@
+# Publishes the image that container-e2e.yml staged (stage-image-artifact: true) once the caller's other jobs have passed.
+# The caller gives this job `needs:` on its checks AND on the job that called container-e2e.yml, so the image reaches the registry
+# only after every gate is green; the image is the tested one (docker save / docker load, compared by image Id), not a rebuild.
+#
+#   e2e-publish:                                        # the caller's job id: with the job name below the check reads `e2e-publish / e2e`
+#     needs: [gitleaks, check, e2e-test]
+#     if: github.event_name != 'pull_request'
+#     permissions:
+#       contents: read
+#       packages: write
+#     uses: azzarabe/azzara-infra/.github/workflows/publish-tested-image.yml@main
+#     with:
+#       image: ghcr.io/azzarabe/azzara-template
+#       runs_on: '["self-hosted","azzara-ci-box"]'      # optional, as in container-e2e.yml
+#
+# Contract: the artifact `tested-image-<github.sha>` of the same workflow run holds image.tar.gz (docker save of the tag
+# tested-<github.sha>) and image.id. Fail closed: outside a push to main or a workflow_dispatch on main this job FAILS (it never ends
+# green without publishing), and a missing artifact, an Id mismatch or a platform other than linux/amd64 fails it before any push.
+# The publish step is the one of container-e2e.yml, copied unchanged, except that the local image is named tested-<github.sha> and not e2e-app-image, because the box's runners share one Docker daemon (tag check, linux/amd64 check, login, push, digest, summary);
+# a tag that exists is refused, never pushed again.
+name: publish-tested-image
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "the image name to publish, e.g. ghcr.io/azzarabe/azzara-template; the tag is sha-<github.sha>"
+        type: string
+        required: true
+      runs_on:
+        description: 'JSON for the job''s runs-on: a string ("ubuntu-latest") or an array (["self-hosted","azzara-ci"])'
+        type: string
+        default: '"ubuntu-latest"'
+
+jobs:
+  publish:
+    name: e2e
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 15
+    steps:
+      - name: Only a push to main or a dispatch on main publishes
+        if: github.ref != 'refs/heads/main' || (github.event_name != 'push' && github.event_name != 'workflow_dispatch')
+        run: |
+          echo "::error::publish-tested-image runs only on a push to main or a workflow_dispatch on main (ref ${GITHUB_REF}, event ${GITHUB_EVENT_NAME}); nothing published"
+          exit 1
+      - name: Download the tested image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tested-image-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-image
+      - name: Load the tested image and compare its Id
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/tested-image"
+          [ -s "${stage}/image.id" ] && [ -s "${stage}/image.tar.gz" ] || { echo "::error::the artifact lacks image.id or image.tar.gz"; exit 1; }
+          docker image rm -f "tested-${GITHUB_SHA}" >/dev/null 2>&1 || true
+          gunzip -c "${stage}/image.tar.gz" | docker load
+          loaded="$(docker image inspect "tested-${GITHUB_SHA}" --format '{{.Id}}')"
+          tested="$(cat "${stage}/image.id")"
+          if [ "${loaded}" != "${tested}" ]; then
+            echo "::error::the loaded image is ${loaded}, the tested one was ${tested}; nothing pushed"
+            exit 1
+          fi
+          echo "loaded image Id equals the tested image Id: ${loaded}"
+      - name: Publish the tested image (main only)
+        env:
+          IMAGE_NAME: ${{ inputs.image }}
+          TAG: sha-${{ github.sha }}
+          REGISTRY_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          LOCAL_IMAGE: tested-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          repo="${IMAGE_NAME#ghcr.io/}"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
+          # No credential goes through argv: curl takes the GITHUB_TOKEN and the bearers from a config on stdin (-K -). The
+          # config needs no escaping: a GitHub login and token contain no quote and no backslash.
+          # A registry bearer for this repository, in $bearer (masked); on failure a non-zero status and the cause in
+          # $bearer_err. It is minted again right before the read after the push: a bearer minted before a long push may
+          # have expired.
+          mint_bearer() {
+            local reply
+            bearer=""
+            bearer_err=""
+            if ! reply="$(printf 'user = "%s:%s"\n' "${ACTOR}" "${REGISTRY_TOKEN}" | curl -fsS --max-time 30 -K - "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull,push")"; then
+              bearer_err="the token request to ghcr.io failed"
+              return 1
+            fi
+            if ! bearer="$(printf '%s' "${reply}" | jq -er '.token // .access_token')"; then
+              bearer=""
+              bearer_err="ghcr.io/token answered without a token"
+              return 1
+            fi
+            echo "::add-mask::${bearer}"
+          }
+          # A request to the registry with the current bearer.
+          reg_get() {
+            printf 'header = "Authorization: Bearer %s"\n' "${bearer}" | curl --max-time 30 -K - -H "Accept: ${accept}" "$@"
+          }
+          if ! mint_bearer; then
+            echo "::error::${bearer_err}; nothing pushed"
+            exit 1
+          fi
+          code="$(reg_get -sS -o /dev/null -w '%{http_code}' "https://ghcr.io/v2/${repo}/manifests/${TAG}")"
+          echo "tag check: HTTP ${code}"
+          if [ "${code}" = "200" ]; then
+            echo "::error::${IMAGE_NAME}:${TAG} exists; a tag is never pushed twice"
+            exit 1
+          elif [ "${code}" != "404" ]; then
+            echo "::error::could not tell whether ${IMAGE_NAME}:${TAG} exists (HTTP ${code}); nothing pushed"
+            exit 1
+          fi
+          # Everything that can refuse the publication comes before the login and the push.
+          platform="$(docker image inspect "${LOCAL_IMAGE}" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+          if [ "${platform}" != "linux/amd64" ]; then
+            echo "::error::"${LOCAL_IMAGE}" is ${platform:-unreadable}, not linux/amd64; nothing pushed"
+            exit 1
+          fi
+          user="$(docker image inspect "${LOCAL_IMAGE}" --format '{{.Config.User}}' 2>/dev/null)" || user="unread"
+          printf '%s' "${REGISTRY_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+          trap 'docker logout ghcr.io || echo "::warning::docker logout ghcr.io failed"' EXIT
+          docker tag "${LOCAL_IMAGE}" "${IMAGE_NAME}:${TAG}"
+          docker push "${IMAGE_NAME}:${TAG}" | tee "${RUNNER_TEMP}/push.log"
+          # From here on the image is published: nothing is fatal except a digest that cannot be read at all.
+          digest="$(grep -m 1 -oE 'digest: sha256:[0-9a-f]{64}' "${RUNNER_TEMP}/push.log" | cut -d' ' -f2 || true)"
+          if [ -z "${digest}" ]; then
+            repo_digest="$(docker image inspect "${IMAGE_NAME}:${TAG}" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
+            digest="${repo_digest#*@}"
+          fi
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::pushed ${IMAGE_NAME}:${TAG}, but its digest could not be read"
+            exit 1
+          fi
+          media="unread"
+          if mint_bearer && media_type="$(reg_get -fsS -o /dev/null -w '%{content_type}' "https://ghcr.io/v2/${repo}/manifests/${digest}")" && [ -n "${media_type}" ]; then
+            media="${media_type}"
+          else
+            echo "::warning::could not read the manifest media type of ${digest}; the image is published"
+          fi
+          {
+            echo "### Published"
+            echo "- image: \`${IMAGE_NAME}:${TAG}\`"
+            echo "- digest: \`${digest}\`"
+            echo "- manifest media type: \`${media}\`"
+            echo "- platform: \`${platform}\`, config user: \`${user}\`"
+          } | tee -a "${GITHUB_STEP_SUMMARY}" || echo "::warning::could not write the run summary"
+      - name: Remove the local image tags
+        if: always()
+        run: docker image rm -f "tested-${GITHUB_SHA}" "${IMAGE_NAME}:sha-${GITHUB_SHA}" >/dev/null 2>&1 || true
+        env:
+          IMAGE_NAME: ${{ inputs.image }}

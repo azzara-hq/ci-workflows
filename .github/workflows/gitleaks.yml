@@ -1,0 +1,77 @@
+# Shared secret-leak gate (Wave 2 item 8 — "gitleaks in shared CI", ultra-review SOTA item).
+#
+# REUSABLE (workflow_call): any azzarabe repo adds
+#
+#   gitleaks:
+#     uses: azzarabe/azzara-infra/.github/workflows/gitleaks.yml@main
+#     with:                                          # optional; omit it and the job runs on ubuntu-latest, as before
+#       runs_on: '["self-hosted","azzara-ci"]'       # a JSON value: a string, or an array of labels
+#
+# to its CI. runs_on is the `runs-on` of the job, JSON-encoded because a workflow_call input is a string; its default
+# '"ubuntu-latest"' is what every caller got before the input existed. This repo's OWN runs (push to main, manual dispatch)
+# pass no input; the fallback after `||` in the expression below is for them: the self-hosted runner (label azzara-ci).
+# Requires this repo's Actions access setting to allow user-owned repos
+# (Settings → Actions → General → Access, set once via API — see docs/runbooks/key-incident.md
+# in azzara-spirit for the incident half of this control).
+#
+# What it does: FULL-HISTORY scan (fetch-depth 0 — leaks live in history, not HEAD) with a
+# PINNED gitleaks release (stack-pins rule: nothing the platform runs on self-updates), output
+# REDACTED (a CI log must never re-leak what it found). False positives are allowlisted per
+# repo via a committed .gitleaksignore (fingerprint lines) — never by loosening rules globally.
+# A finding fails the job → the repo's CI goes red → rotate per the key-incident runbook first,
+# THEN allowlist only if it was provably not a live secret.
+name: gitleaks
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'JSON for the job''s runs-on: a string ("ubuntu-latest") or an array (["self-hosted","azzara-ci"])'
+        type: string
+        default: '"ubuntu-latest"'
+  workflow_dispatch:
+  # Every pull request of this repository, unfiltered (owner decision 2026-10-28): before, only pull requests matching
+  # webhook-and-units' paths were scanned (through its call, removed 2026-10-30), so a change elsewhere, .gitleaksignore
+  # among them, was first scanned after the merge. Pinned by hosts/vps-azzara/scripts/tests/suite-coverage/test_gitleaks_triggers.py.
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  GITLEAKS_VERSION: "8.24.3"
+
+jobs:
+  scan:
+    # Callers set (or default) inputs.runs_on; this repo's own push and dispatch runs pass none and take the self-hosted fallback.
+    runs-on: ${{ fromJSON(inputs.runs_on || '["self-hosted","azzara-ci"]') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history — that's where leaks hide
+          persist-credentials: false
+      - name: Install pinned gitleaks
+        run: |
+          set -euo pipefail
+          # Up to 3 tries of download + pinned-checksum check: on 2026-11-08 one bad download (corrupted, or
+          # "curl: (56) Connection died") failed this check on 4 runs in a row on azzara-ci-box-template and a
+          # clean pull request was rejected for it. Only a file that matches the pinned sha256 is unpacked.
+          # Pinned by hosts/vps-azzara/scripts/tests/suite-coverage/test_gitleaks_install_retry.py.
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          for try in 1 2 3; do
+            rm -f /tmp/gitleaks.tgz
+            if curl -sSL -o /tmp/gitleaks.tgz "$url" && echo "${GITLEAKS_LINUX_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -; then
+              break
+            fi
+            if [ "$try" -eq 3 ]; then
+              echo "gitleaks download failed or did not match the pinned sha256 on 3 tries" >&2
+              exit 1
+            fi
+            echo "gitleaks download try $try failed; trying again in $((try * 15)) s" >&2
+            sleep $((try * 15))
+          done
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks version
+        env:
+          # Official checksum for gitleaks_8.24.3_linux_x64.tar.gz (release checksums.txt).
+          GITLEAKS_LINUX_SHA256: "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c"
+      - name: Scan full git history (redacted output)
+        run: /tmp/gitleaks git --redact --no-banner --verbose .

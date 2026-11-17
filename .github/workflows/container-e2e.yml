@@ -1,0 +1,421 @@
+# Shared container e2e gate for Node products (P0 — azzara-spirit spec 2026-10-09 §5.10, §5.11, §7).
+# Builds the product's Docker image, runs its migrations and the image against a disposable
+# PostgreSQL 16, then the product's own end-to-end command against it. Products deploy that same
+# Dockerfile, so this proves the artifact, not a dev server.
+#
+#   e2e:
+#     uses: azzarabe/azzara-infra/.github/workflows/container-e2e.yml@main
+#     with:
+#       private-repos: azzara-auth,azzara-ai,azzara-ui
+#       migrate-command: node scripts/migrate.mjs
+#       container-env: |
+#         BETTER_AUTH_SECRET=${E2E_SECRET}
+#       runs_on: '["self-hosted","azzara-ci"]'           # optional: the job's runs-on as JSON; omit it and the job runs on ubuntu-latest
+#       playwright-with-deps: false                       # optional: a runner without root installs Chromium without --with-deps (apt)
+#       node-modules-cache: true                          # optional: reuse node_modules by lockfile hash (as node-check.yml)
+#       image-cache: true                                 # optional: reuse the image's unchanged layers from the Actions cache (see below)
+#     secrets:                                          # only these two — never `secrets: inherit`
+#       AZZARA_APP_ID: ${{ secrets.AZZARA_APP_ID }}
+#       AZZARA_APP_PRIVATE_KEY: ${{ secrets.AZZARA_APP_PRIVATE_KEY }}
+#
+# Contract: a Dockerfile in working-directory that accepts the optional BuildKit secret `gh_token`
+# and the build args BUILD_COMMIT and BUILD_REF, and whose image listens on $PORT. The container gets DATABASE_URL
+# and PORT; container-env adds lines in which ${E2E_SECRET} (random per run) and ${DATABASE_URL}
+# are substituted. e2e-command runs in working-directory with BASE_URL, E2E_CONTAINER and E2E_SECRET set.
+# The product must also: commit a package-lock.json in working-directory; hold AZZARA_APP_ID and
+# AZZARA_APP_PRIVATE_KEY as its own repository secrets (azzarabe is a user account: no org secrets);
+# ship `sh` and GNU grep in the image (the token guard runs inside it) and an ENTRYPOINT that executes
+# its arguments (the migration runs `IMAGE sh -c <migrate-command>`); answer on 127.0.0.1:$PORT under
+# --network host; exclude node_modules and test-results in .dockerignore (npm ci runs in the build
+# context first). E2E_SECRET (masked in the logs) is also visible to e2e-command, as $E2E_SECRET: the
+# same random per-run value the container got, e.g. e2e-command: BETTER_AUTH_SECRET="$E2E_SECRET" npx playwright test. container-env lines are passed literally
+# (no quote stripping, one line per value). One call per caller run: the artifact name is fixed.
+#
+# node-modules-cache (optional, off by default): as in node-check.yml, node_modules is restored from the Actions cache
+# for the exact key (runner OS and architecture, Node version, SHA-256 of package-lock.json) and `npm ci` is skipped on a
+# hit; on a miss `npm ci` runs and its node_modules is saved. Only for private callers: the cache holds the private
+# packages' installed code. It does not touch the image: the Dockerfile's own install is unchanged.
+#
+# image-cache (optional, off by default): the image is built by docker/build-push-action on a buildx builder (docker-container driver)
+# with cache-from/cache-to type=gha, scope e2e-image, instead of `docker build`, and loaded into the runner's daemon as
+# e2e-app-image. A docker row of the CI box gets a fresh Docker daemon for each job (ci-runner.sh, the reset service of I8b), so
+# no layer survives on the runner and the Actions cache is the only place the layers can wait. What can hit: the layers whose
+# inputs did not change, in the Dockerfile of azzara-template the apt install and `npm ci` of the deps stage (keyed by
+# package.json and package-lock.json); the build stage re-runs when the sources change. A failed cache export does not fail the
+# job (ignore-error). Only for private callers: the exported layers (mode=max) hold the private packages' installed code and the
+# sources, in this repository's Actions cache; the token guard below scans only the final image, not these layers. With the
+# input off, the step `docker build` below is exactly as it was and no step of this paragraph runs.
+#
+# Publishing (optional): with publish-image set (e.g. ghcr.io/azzarabe/azzara-template), and only on a push to main or a
+# workflow_dispatch on main, the image this job tested is pushed as <publish-image>:sha-<github.sha> after the end-to-end
+# command passes — the tested bytes, not a rebuild, linux/amd64. A tag that exists is refused, never pushed again. The
+# caller grants this job `packages: write`, so the job's GITHUB_TOKEN carries it; besides the publish step,
+# actions/checkout and actions/setup-node receive that token through their default `token` input. All actions are
+# pinned by SHA. The run summary prints the digest, the manifest's media type, the platform and the config user.
+# Builds also pass BUILD_REF=<github.ref_name>. A caller that sets publish-image must gate this job on its own checks
+# with `needs:`, because this workflow cannot see its caller's jobs.
+# On pull-request runs the caller's job may still hold `packages: write`; the publish guard is the `if:` on main.
+#
+# Staging the tested image instead of publishing it (optional, off by default): with stage-image-artifact: true, and only on a
+# push to main or a workflow_dispatch on main, this job does NOT publish. After the end-to-end command passes it saves the
+# image it tested (docker save) and uploads it as the artifact `tested-image-<github.sha>` together with the image Id, so the
+# caller can run this job in parallel with its own checks and publish with publish-tested-image.yml in a later job that `needs:`
+# both. publish-image must then be empty (a guard step fails the job otherwise). With the input off, no step below it runs and
+# the publish step is exactly as it was.
+#
+# Token guard scope: it greps the FINAL merged filesystem of the image for `x-access-token` or the
+# installation-token shape, and fails closed if the scan cannot complete. It does NOT see a token
+# written and deleted in a later layer, files containing a NUL byte, or directories named proc, sys or
+# dev at any depth. The App token is revoked at job end and, without publish-image, the image never leaves the runner.
+name: container-e2e
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "24"
+      working-directory:
+        type: string
+        default: "."
+      private-repos:
+        type: string
+        default: ""
+      app-port:
+        type: number
+        default: 3000
+      health-path:
+        type: string
+        default: "/api/health"
+      migrate-command:
+        type: string
+        default: ""
+      container-env:
+        type: string
+        default: ""
+      e2e-command:
+        type: string
+        default: "npx playwright test"
+      playwright:
+        type: boolean
+        default: true
+      playwright-with-deps:
+        description: "true = npx playwright install --with-deps chromium (needs root, for apt); false = npx playwright install chromium, without --with-deps"
+        type: boolean
+        default: true
+      results-path:
+        type: string
+        default: "test-results"
+      publish-image:
+        type: string
+        default: ""
+      stage-image-artifact:
+        description: "true = do not publish: upload the tested image as the artifact tested-image-<github.sha> for publish-tested-image.yml (main push or dispatch only; publish-image must be empty); false = as before"
+        type: boolean
+        default: false
+      node-modules-cache:
+        description: "true = restore node_modules from the Actions cache by exact lockfile key and skip npm ci on a hit; false = npm ci every run"
+        type: boolean
+        default: false
+      image-cache:
+        description: "true = build the image with docker/build-push-action and the Actions cache (type=gha) for its layers; false = docker build every run, as before"
+        type: boolean
+        default: false
+      runs_on:
+        description: 'JSON for the job''s runs-on: a string ("ubuntu-latest") or an array (["self-hosted","azzara-ci"])'
+        type: string
+        default: '"ubuntu-latest"'
+    secrets:
+      AZZARA_APP_ID:
+        required: false
+      AZZARA_APP_PRIVATE_KEY:
+        required: false
+
+jobs:
+  e2e:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: e2e
+          POSTGRES_PASSWORD: e2e
+          POSTGRES_DB: e2e
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U e2e"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      DATABASE_URL: postgres://e2e:e2e@127.0.0.1:5432/e2e
+      PORT: ${{ inputs.app-port }}
+    steps:
+      - name: stage-image-artifact and publish-image are exclusive
+        if: inputs.stage-image-artifact && inputs.publish-image != ''
+        run: |
+          echo "::error::stage-image-artifact is true and publish-image is set: the image would be published twice. Unset publish-image; publish-tested-image.yml publishes the staged image."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "npm"
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        if: inputs.private-repos != ''
+        id: app-token
+        with:
+          app-id: ${{ secrets.AZZARA_APP_ID }}
+          private-key: ${{ secrets.AZZARA_APP_PRIVATE_KEY }}
+          owner: azzarabe
+          repositories: ${{ inputs.private-repos }}
+          permission-contents: read
+      - name: Configure git auth for the private @azzara/* packages
+        if: inputs.private-repos != ''
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - name: node_modules cache key
+        if: inputs.node-modules-cache
+        id: nm-key
+        env:
+          LOCK_HASH: ${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LOCK_HASH}" ]; then echo "::error::no package-lock.json to key node_modules on"; exit 1; fi
+          echo "key=node-modules-${RUNNER_OS}-${RUNNER_ARCH}-$(node -p process.version)-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+      - name: Restore node_modules (exact key only)
+        if: inputs.node-modules-cache
+        id: nm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ inputs.working-directory }}/node_modules
+          key: ${{ steps.nm-key.outputs.key }}
+      - name: npm ci
+        if: steps.nm-cache.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Save node_modules
+        if: inputs.node-modules-cache && steps.nm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ inputs.working-directory }}/node_modules
+          key: ${{ steps.nm-key.outputs.key }}
+      - name: Install Playwright Chromium
+        if: inputs.playwright && inputs.playwright-with-deps
+        run: npx playwright install --with-deps chromium
+      - name: Install Playwright Chromium (without root)
+        if: inputs.playwright && !inputs.playwright-with-deps
+        run: npx playwright install chromium
+      - name: Set up buildx (image-cache)
+        if: inputs.image-cache
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the image with the layer cache (image-cache; private packages only as a BuildKit secret)
+        if: inputs.image-cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          context: ${{ inputs.working-directory }}
+          load: true
+          push: false
+          tags: e2e-app-image
+          build-args: |
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_REF=${{ github.ref_name }}
+          secret-envs: ${{ steps.app-token.outputs.token != '' && 'gh_token=GH_APP_TOKEN' || '' }}
+          cache-from: type=gha,scope=e2e-image
+          cache-to: type=gha,scope=e2e-image,mode=max,ignore-error=true
+      - name: Build the image (private packages only as a BuildKit secret)
+        if: ${{ !inputs.image-cache }}
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          BUILD_COMMIT: ${{ github.sha }}
+          BUILD_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "${GH_APP_TOKEN}" ]; then
+            docker build --secret id=gh_token,env=GH_APP_TOKEN --build-arg BUILD_COMMIT="${BUILD_COMMIT}" --build-arg BUILD_REF="${BUILD_REF}" -t e2e-app-image .
+          else
+            docker build --build-arg BUILD_COMMIT="${BUILD_COMMIT}" --build-arg BUILD_REF="${BUILD_REF}" -t e2e-app-image .
+          fi
+      - name: The image's final filesystem carries no token
+        run: |
+          set +e
+          found="$(docker run --rm --user root --entrypoint sh e2e-app-image -c 'grep -rIlE "x-access-token|ghs_[A-Za-z0-9._-]{20,}" / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev')"
+          rc=$?
+          set -e
+          echo "token scan exit status: ${rc}"
+          if [ -n "${found}" ]; then
+            echo "::error::a GitHub token reached the image, in:"
+            printf '%s\n' "${found}"
+            exit 1
+          elif [ "${rc}" -ne 1 ]; then
+            echo "::error::the token scan did not complete (exit ${rc}); its errors are above"
+            exit 1
+          fi
+          echo "token scan: no token in the image"
+      - name: Container environment
+        env:
+          CONTAINER_ENV: ${{ inputs.container-env }}
+        run: |
+          set -euo pipefail
+          E2E_SECRET="$(openssl rand -hex 32)"
+          export E2E_SECRET
+          # Masked before the value is written anywhere a log or a later step could take it; then handed to the later steps
+          # (the End-to-end step's e2e-command reads $E2E_SECRET). container-env is unchanged.
+          echo "::add-mask::${E2E_SECRET}"
+          echo "E2E_SECRET=${E2E_SECRET}" >> "${GITHUB_ENV}"
+          {
+            echo "DATABASE_URL=${DATABASE_URL}"
+            echo "PORT=${PORT}"
+            printf '%s\n' "${CONTAINER_ENV}" | envsubst '${E2E_SECRET} ${DATABASE_URL}'
+          } | sed '/^$/d' > "${RUNNER_TEMP}/e2e.env"
+      - name: Migrate
+        if: inputs.migrate-command != ''
+        env:
+          MIGRATE_COMMAND: ${{ inputs.migrate-command }}
+        run: timeout 300 docker run --rm --network host --env-file "${RUNNER_TEMP}/e2e.env" e2e-app-image sh -c "${MIGRATE_COMMAND}"
+      - name: Start the container
+        run: docker run -d --name e2e-app --network host --env-file "${RUNNER_TEMP}/e2e.env" e2e-app-image
+      - name: Wait for health
+        env:
+          HEALTH_PATH: ${{ inputs.health-path }}
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 5 "http://127.0.0.1:${PORT}${HEALTH_PATH}" > /dev/null; then echo "healthy after ${i} s"; exit 0; fi
+            sleep 1
+          done
+          echo "::error::no healthy answer on ${HEALTH_PATH} within 60 s"
+          exit 1
+      - name: End-to-end
+        env:
+          E2E_COMMAND: ${{ inputs.e2e-command }}
+          BASE_URL: http://127.0.0.1:${{ inputs.app-port }}
+          E2E_CONTAINER: e2e-app
+        run: sh -c "${E2E_COMMAND}"
+      - name: Save the tested image (stage-image-artifact, main only)
+        if: success() && inputs.stage-image-artifact && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          set -euo pipefail
+          stage="${RUNNER_TEMP}/tested-image"
+          rm -rf "${stage}"
+          mkdir -p "${stage}"
+          # A tag of its own: the Docker daemon is shared by the box's runners, so no other job's `e2e-app-image` is touched later.
+          docker tag e2e-app-image "tested-${GITHUB_SHA}"
+          docker image inspect "tested-${GITHUB_SHA}" --format '{{.Id}}' > "${stage}/image.id"
+          docker save "tested-${GITHUB_SHA}" | gzip -1 > "${stage}/image.tar.gz"
+          echo "saved: id $(cat "${stage}/image.id"), $(stat -c %s "${stage}/image.tar.gz") bytes gzipped"
+      - name: Upload the tested image (stage-image-artifact, main only)
+        if: success() && inputs.stage-image-artifact && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tested-image-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-image
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+      - name: Publish the tested image (main only)
+        if: success() && inputs.publish-image != '' && !inputs.stage-image-artifact && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          IMAGE_NAME: ${{ inputs.publish-image }}
+          TAG: sha-${{ github.sha }}
+          REGISTRY_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          repo="${IMAGE_NAME#ghcr.io/}"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
+          # No credential goes through argv: curl takes the GITHUB_TOKEN and the bearers from a config on stdin (-K -). The
+          # config needs no escaping: a GitHub login and token contain no quote and no backslash.
+          # A registry bearer for this repository, in $bearer (masked); on failure a non-zero status and the cause in
+          # $bearer_err. It is minted again right before the read after the push: a bearer minted before a long push may
+          # have expired.
+          mint_bearer() {
+            local reply
+            bearer=""
+            bearer_err=""
+            if ! reply="$(printf 'user = "%s:%s"\n' "${ACTOR}" "${REGISTRY_TOKEN}" | curl -fsS --max-time 30 -K - "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull,push")"; then
+              bearer_err="the token request to ghcr.io failed"
+              return 1
+            fi
+            if ! bearer="$(printf '%s' "${reply}" | jq -er '.token // .access_token')"; then
+              bearer=""
+              bearer_err="ghcr.io/token answered without a token"
+              return 1
+            fi
+            echo "::add-mask::${bearer}"
+          }
+          # A request to the registry with the current bearer.
+          reg_get() {
+            printf 'header = "Authorization: Bearer %s"\n' "${bearer}" | curl --max-time 30 -K - -H "Accept: ${accept}" "$@"
+          }
+          if ! mint_bearer; then
+            echo "::error::${bearer_err}; nothing pushed"
+            exit 1
+          fi
+          code="$(reg_get -sS -o /dev/null -w '%{http_code}' "https://ghcr.io/v2/${repo}/manifests/${TAG}")"
+          echo "tag check: HTTP ${code}"
+          if [ "${code}" = "200" ]; then
+            echo "::error::${IMAGE_NAME}:${TAG} exists; a tag is never pushed twice"
+            exit 1
+          elif [ "${code}" != "404" ]; then
+            echo "::error::could not tell whether ${IMAGE_NAME}:${TAG} exists (HTTP ${code}); nothing pushed"
+            exit 1
+          fi
+          # Everything that can refuse the publication comes before the login and the push.
+          platform="$(docker image inspect e2e-app-image --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+          if [ "${platform}" != "linux/amd64" ]; then
+            echo "::error::e2e-app-image is ${platform:-unreadable}, not linux/amd64; nothing pushed"
+            exit 1
+          fi
+          user="$(docker image inspect e2e-app-image --format '{{.Config.User}}' 2>/dev/null)" || user="unread"
+          printf '%s' "${REGISTRY_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+          trap 'docker logout ghcr.io || echo "::warning::docker logout ghcr.io failed"' EXIT
+          docker tag e2e-app-image "${IMAGE_NAME}:${TAG}"
+          docker push "${IMAGE_NAME}:${TAG}" | tee "${RUNNER_TEMP}/push.log"
+          # From here on the image is published: nothing is fatal except a digest that cannot be read at all.
+          digest="$(grep -m 1 -oE 'digest: sha256:[0-9a-f]{64}' "${RUNNER_TEMP}/push.log" | cut -d' ' -f2 || true)"
+          if [ -z "${digest}" ]; then
+            repo_digest="$(docker image inspect "${IMAGE_NAME}:${TAG}" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
+            digest="${repo_digest#*@}"
+          fi
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::pushed ${IMAGE_NAME}:${TAG}, but its digest could not be read"
+            exit 1
+          fi
+          media="unread"
+          if mint_bearer && media_type="$(reg_get -fsS -o /dev/null -w '%{content_type}' "https://ghcr.io/v2/${repo}/manifests/${digest}")" && [ -n "${media_type}" ]; then
+            media="${media_type}"
+          else
+            echo "::warning::could not read the manifest media type of ${digest}; the image is published"
+          fi
+          {
+            echo "### Published"
+            echo "- image: \`${IMAGE_NAME}:${TAG}\`"
+            echo "- digest: \`${digest}\`"
+            echo "- manifest media type: \`${media}\`"
+            echo "- platform: \`${platform}\`, config user: \`${user}\`"
+          } | tee -a "${GITHUB_STEP_SUMMARY}" || echo "::warning::could not write the run summary"
+      - name: Container logs
+        if: failure()
+        run: docker logs e2e-app || true
+      - name: Upload results
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-results
+          path: ${{ inputs.working-directory }}/${{ inputs.results-path }}
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Remove the container
+        if: always()
+        run: docker rm -f e2e-app || true
