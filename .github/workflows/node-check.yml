@@ -38,8 +38,8 @@
 # The audit step has two paths. With no `.nsprc` in working-directory it is `npm audit --omit=dev --audit-level=high`, as security.md says.
 # With a `.nsprc` it runs the pinned better-npm-audit 4.2.1 (`-l high -p --require-expiry --require-notes --max-expiry-days 30`) and a checker,
 # .github/audit-gate/check-exceptions-unpatched.mjs. `.nsprc` keys are GHSA ids only, each with `notes` and an `expiry` at most 30 days ahead;
-# the checker fails when a named advisory has a patched version for any package, is withdrawn, or when the GitHub advisory API cannot be read
-# (fail closed). An exception therefore lapses by expiry, and as soon as a fix is published. Tests: .github/audit-gate/test/ (audit-gate.yml).
+# the checker fails when a named advisory has a patched version for any package or names no package, or when the GitHub advisory API cannot
+# be read (fail closed); a withdrawn advisory with no patched version passes with a warning (npm audit can keep reporting it). An exception therefore lapses by expiry, and as soon as a fix is published. Tests: .github/audit-gate/test/ (audit-gate.yml).
 # The tool's package.json and lockfile and the checker are embedded in the step as copies of the files in .github/audit-gate/.
 #
 # `node-modules-cache: true` restores node_modules from the Actions cache when one was saved for the exact key (runner OS
@@ -505,9 +505,10 @@ jobs:
           }
           AUDIT_GATE_PACKAGE_LOCK_EOF
           cat > "$tool/check-exceptions-unpatched.mjs" <<'AUDIT_GATE_CHECKER_EOF'
-          // Fails when an audit exception in .nsprc may no longer stand: the key is not a GHSA id, or the advisory is withdrawn,
-          // or it now has a patched version for any package (GitHub advisory API first_patched_version not null), or the API
-          // cannot be read. It fails closed. Expiry, notes and the audit itself are better-npm-audit's job
+          // Fails when an audit exception in .nsprc may no longer stand: the key is not a GHSA id, or the advisory now has a
+          // patched version for any package (GitHub advisory API first_patched_version not null) or names no package, or the API
+          // cannot be read. It fails closed. A withdrawn advisory with no patched version passes with a warning: npm audit can
+          // keep reporting it after GitHub withdraws it, and the exception's expiry still caps it. Expiry, notes and the audit itself are better-npm-audit's job
           // (--require-expiry --require-notes --max-expiry-days, see node-check.yml).
           // Usage: node check-exceptions-unpatched.mjs [path/to/.nsprc]   (GITHUB_TOKEN optional, raises the API rate limit)
           // ADVISORY_API (default https://api.github.com/advisories/) exists for the tests' stub server only.
@@ -545,10 +546,12 @@ jobs:
             }
             const adv = await res.json();
             const patched = (adv.vulnerabilities ?? []).filter((v) => v.first_patched_version);
-            if (adv.withdrawn_at || patched.length > 0 || (adv.vulnerabilities ?? []).length === 0) {
-              const what = patched.map((v) => `${v.package?.name} ${v.first_patched_version}`).join(", ") || "withdrawn or no package";
+            if (patched.length > 0 || (adv.vulnerabilities ?? []).length === 0) {
+              const what = patched.map((v) => `${v.package?.name} ${v.first_patched_version}`).join(", ") || "no package";
               console.error(`::error::${id}: a fix exists (${what}); update the dependency and remove the exception`);
               failed = true;
+            } else if (adv.withdrawn_at) {
+              console.log(`::warning::${id}: withdrawn on ${adv.withdrawn_at} with no patched version; remove the exception once npm audit stops reporting it`);
             } else {
               console.log(`${id}: no patched version published (${adv.vulnerabilities.map((v) => `${v.package?.name} ${v.vulnerable_version_range}`).join(", ")})`);
             }
