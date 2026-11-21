@@ -11,6 +11,7 @@
 #       runs_on: '["self-hosted","azzara-ci"]'           # optional: the job's runs-on as JSON; omit it and the job runs on ubuntu-latest
 #       node-modules-cache: true                         # optional: reuse node_modules by lockfile hash (see below)
 #       changed-only: true                               # optional: on a pull request, run only the tests the change touches (see below)
+#       always-run: test/x.test.ts test/y.test.ts         # optional: with changed-only, test files a pull request also runs (see below)
 #       timeout-minutes: 30                              # optional: the job's timeout in minutes; default 15 (see below)
 #       playwright: true                                 # optional: install Playwright's Chromium headless shell for the tests (see below)
 #       test-command: npm run test:nightly               # optional: run this command instead of the test step (see below)
@@ -56,6 +57,14 @@
 # request with the input off. To see the diff the checkout fetches the whole history (fetch-depth 0), and the step stops
 # with an error when origin/<base> is not there: vitest itself exits 0 ("No test files found") when the diff cannot be read.
 # A pull request that changes no file a test imports runs no test and passes; that is vitest's own result.
+#
+# `always-run` (string, default empty; only with `changed-only: true`): space-separated test files that a pull request also runs, in a second
+# `npx vitest run <files>` after the `--changed` one. For tests whose subject is the whole tree (every route has a guard, every migration has an
+# inverse): they import none of the files they check, so `--changed` never selects them when such a file is added, and a green pull request
+# could make main red (immo-plateforme 6eadb4c, 2026-11-21). The names are vitest filters (a file runs when its path contains a name), so give
+# full paths: a short name can select more files. A name that matches no file fails the step (vitest exits 1 on "No test files found"), so a
+# renamed or removed file is not passed over silently; a blank value (whitespace only) fails it too. Empty = no step; push, dispatch and
+# schedule runs are unchanged.
 #
 # `timeout-minutes` (number, default 15): the check job's timeout-minutes. A product whose full `npm run test:coverage` needs more
 # than 15 minutes on its runner passes a larger value; omit it and the job keeps the 15 minutes it always had.
@@ -110,6 +119,10 @@ on:
         description: "true = on a pull_request event run `vitest run --changed origin/<base>` (no coverage) instead of npm run test:coverage; any other event still runs test:coverage"
         type: boolean
         default: false
+      always-run:
+        description: "with changed-only: space-separated test files a pull_request also runs (npx vitest run <files>, after the --changed run); empty = no extra step"
+        type: string
+        default: ""
       timeout-minutes:
         description: "The check job's timeout in minutes"
         type: number
@@ -579,6 +592,16 @@ jobs:
             echo "::error::origin/${BASE_REF} is not in the checkout, so vitest cannot read the diff (it would exit 0 having run nothing)"; exit 1
           fi
           npx vitest run --changed "origin/${BASE_REF}"
+      - name: Tests the pull request always runs (always-run)
+        if: inputs.test-command == '' && inputs.changed-only && github.event_name == 'pull_request' && inputs.always-run != ''
+        env:
+          ALWAYS_RUN: ${{ inputs.always-run }}
+        run: |
+          set -euo pipefail
+          read -r -a files <<<"$ALWAYS_RUN"
+          # A blank value would leave no argument, and `vitest run` with none runs the whole suite: refuse instead.
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::always-run is blank (whitespace only)"; exit 1; }
+          npx vitest run "${files[@]}"
       - run: npm run test:coverage
         if: ${{ inputs.test-command == '' && !(inputs.changed-only && github.event_name == 'pull_request') }}
       - name: Tests (the caller's test-command)
