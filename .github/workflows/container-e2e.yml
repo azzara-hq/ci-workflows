@@ -48,7 +48,7 @@
 #
 # Publishing (optional): with publish-image set (e.g. ghcr.io/azzarabe/azzara-template), and only on a push to main or a
 # workflow_dispatch on main, the image this job tested is pushed as <publish-image>:sha-<github.sha> after the end-to-end
-# command passes — the tested bytes, not a rebuild, linux/amd64. A tag that exists is refused, never pushed again. The
+# command passes — the tested bytes, not a rebuild, linux/amd64. A tag that exists is never pushed again: it is verified (built from this commit, linux/amd64) and the step passes, else it fails. The
 # caller grants this job `packages: write`, so the job's GITHUB_TOKEN carries it; besides the publish step,
 # actions/checkout and actions/setup-node receive that token through their default `token` input. All actions are
 # pinned by SHA. The run summary prints the digest, the manifest's media type, the platform and the config user.
@@ -56,12 +56,20 @@
 # with `needs:`, because this workflow cannot see its caller's jobs.
 # On pull-request runs the caller's job may still hold `packages: write`; the publish guard is the `if:` on main.
 #
+# Publishing the tested pull-request image (optional, off by default): with publish-on-pr: true and publish-image set, a run of the
+# event pull_request publishes too, but only when the pull request is not a draft AND its head branch is in this repository (a fork
+# never publishes) AND the end-to-end command passed. That run checks out and builds the pull request's head commit
+# (github.event.pull_request.head.sha), not the merge ref (github.sha on pull_request), passes it as BUILD_COMMIT and publishes it as
+# <publish-image>:sha-<head sha>. The commit is computed once, by the step `rev` (it runs before the checkout, so it sets `working-directory: .`: the job's default
+# working-directory does not exist yet). With the input off the commit is github.sha and the checkout ref is the default, so the build and the tag are unchanged:
+# the publish step publishes on main only, as before (except that a tag that exists is verified, see Publishing). A caller that sets it must grant this job `packages: write` on pull_request runs.
+#
 # Staging the tested image instead of publishing it (optional, off by default): with stage-image-artifact: true, and only on a
 # push to main or a workflow_dispatch on main, this job does NOT publish. After the end-to-end command passes it saves the
 # image it tested (docker save) and uploads it as the artifact `tested-image-<github.sha>` together with the image Id, so the
 # caller can run this job in parallel with its own checks and publish with publish-tested-image.yml in a later job that `needs:`
 # both. publish-image must then be empty (a guard step fails the job otherwise). With the input off, no step below it runs and
-# the publish step is exactly as it was.
+# the publish step is as before (a tag that exists is verified, see Publishing).
 #
 # Token guard scope: it greps the FINAL merged filesystem of the image for `x-access-token` or the
 # installation-token shape, and fails closed if the scan cannot complete. It does NOT see a token
@@ -112,6 +120,10 @@ on:
       publish-image:
         type: string
         default: ""
+      publish-on-pr:
+        description: "true = a pull_request run (not a draft, head branch in this repository) also publishes publish-image:sha-<head sha> after the end-to-end command passes, building the PR head commit; false = as before (main push or dispatch only)"
+        type: boolean
+        default: false
       stage-image-artifact:
         description: "true = do not publish: upload the tested image as the artifact tested-image-<github.sha> for publish-tested-image.yml (main push or dispatch only; publish-image must be empty); false = as before"
         type: boolean
@@ -155,16 +167,29 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     env:
+      PR_PUBLISH: ${{ github.event_name == 'pull_request' && inputs.publish-on-pr && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
       DATABASE_URL: postgres://e2e:e2e@127.0.0.1:5432/e2e
       PORT: ${{ inputs.app-port }}
     steps:
       - name: stage-image-artifact and publish-image are exclusive
         if: inputs.stage-image-artifact && inputs.publish-image != ''
+        working-directory: .
         run: |
           echo "::error::stage-image-artifact is true and publish-image is set: the image would be published twice. Unset publish-image; publish-tested-image.yml publishes the staged image."
           exit 1
+      - name: The commit this run builds and tags
+        id: rev
+        working-directory: .
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${PR_PUBLISH}" = "true" ]; then sha="${PR_HEAD_SHA}"; else sha="${EVENT_SHA}"; fi
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ env.PR_PUBLISH == 'true' && steps.rev.outputs.sha || '' }}
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -232,7 +257,7 @@ jobs:
           push: false
           tags: e2e-app-image
           build-args: |
-            BUILD_COMMIT=${{ github.sha }}
+            BUILD_COMMIT=${{ steps.rev.outputs.sha }}
             BUILD_REF=${{ github.ref_name }}
           secret-envs: ${{ steps.app-token.outputs.token != '' && 'gh_token=GH_APP_TOKEN' || '' }}
           cache-from: type=gha,scope=e2e-image
@@ -241,7 +266,7 @@ jobs:
         if: ${{ !inputs.image-cache }}
         env:
           GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
-          BUILD_COMMIT: ${{ github.sha }}
+          BUILD_COMMIT: ${{ steps.rev.outputs.sha }}
           BUILD_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -327,11 +352,12 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           overwrite: true
-      - name: Publish the tested image (main only)
-        if: success() && inputs.publish-image != '' && !inputs.stage-image-artifact && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      - name: Publish the tested image (main, or a same-repository pull request with publish-on-pr)
+        if: success() && inputs.publish-image != '' && !inputs.stage-image-artifact && ((github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) || env.PR_PUBLISH == 'true')
         env:
           IMAGE_NAME: ${{ inputs.publish-image }}
-          TAG: sha-${{ github.sha }}
+          TAG: sha-${{ steps.rev.outputs.sha }}
+          COMMIT: ${{ steps.rev.outputs.sha }}
           REGISTRY_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
         run: |
@@ -369,8 +395,24 @@ jobs:
           code="$(reg_get -sS -o /dev/null -w '%{http_code}' "https://ghcr.io/v2/${repo}/manifests/${TAG}")"
           echo "tag check: HTTP ${code}"
           if [ "${code}" = "200" ]; then
-            echo "::error::${IMAGE_NAME}:${TAG} exists; a tag is never pushed twice"
-            exit 1
+            # The tag exists: the pull request run of this same commit published it. Never push it again; verify instead that the
+            # published image was built from this commit (its .build-info "commit", written from BUILD_COMMIT) and is linux/amd64,
+            # then pass. Any other outcome (unreadable, another commit, another platform) fails the job.
+            printf '%s' "${REGISTRY_TOKEN}" | docker login ghcr.io -u "${ACTOR}" --password-stdin
+            trap 'docker logout ghcr.io || echo "::warning::docker logout ghcr.io failed"' EXIT
+            docker pull -q "${IMAGE_NAME}:${TAG}" > /dev/null
+            have_platform="$(docker image inspect "${IMAGE_NAME}:${TAG}" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+            have_commit="$(docker run --rm --entrypoint cat "${IMAGE_NAME}:${TAG}" .build-info 2>/dev/null | jq -er '.commit' 2>/dev/null || true)"
+            if [ "${have_commit}" != "${COMMIT}" ] || [ "${have_platform}" != "linux/amd64" ]; then
+              echo "::error::${IMAGE_NAME}:${TAG} exists but is not this commit's linux/amd64 image (commit read: ${have_commit:-unreadable}, platform: ${have_platform:-unreadable}); nothing pushed"
+              exit 1
+            fi
+            echo "${IMAGE_NAME}:${TAG} already published for commit ${COMMIT}: verified, not pushed again"
+            {
+              echo "### Already published"
+              echo "- image: \`${IMAGE_NAME}:${TAG}\` (built from commit \`${COMMIT}\`, \`${have_platform}\`), verified, not pushed again"
+            } | tee -a "${GITHUB_STEP_SUMMARY}" || echo "::warning::could not write the run summary"
+            exit 0
           elif [ "${code}" != "404" ]; then
             echo "::error::could not tell whether ${IMAGE_NAME}:${TAG} exists (HTTP ${code}); nothing pushed"
             exit 1
