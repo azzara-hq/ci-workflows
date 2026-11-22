@@ -61,10 +61,11 @@
 # `always-run` (string, default empty; only with `changed-only: true`): space-separated test files that a pull request also runs, in a second
 # `npx vitest run <files>` after the `--changed` one. For tests whose subject is the whole tree (every route has a guard, every migration has an
 # inverse): they import none of the files they check, so `--changed` never selects them when such a file is added, and a green pull request
-# could make main red (immo-plateforme 6eadb4c, 2026-11-21). The names are vitest filters (a file runs when its path contains a name), so give
-# full paths: a short name can select more files. A name that matches no file fails the step (vitest exits 1 on "No test files found"), so a
-# renamed or removed file is not passed over silently; a blank value (whitespace only) fails it too. Empty = no step; push, dispatch and
-# schedule runs are unchanged.
+# could make main red (immo-plateforme 6eadb4c, 2026-11-21). Give each test file's path from working-directory: the step refuses, before
+# vitest, any name that is not a file there, so a renamed or removed file fails the step instead of being passed over (vitest alone fails only
+# when NO name matches: with several names it drops a non-matching one silently, vitest 4.1.2 measured 2026-11-21). The names then reach
+# vitest as filters (a file runs when its path contains a name), so a path can still select another file that contains it. A blank value
+# (whitespace only) fails the step too. Empty = no step; push, dispatch and schedule runs are unchanged.
 #
 # `timeout-minutes` (number, default 15): the check job's timeout-minutes. A product whose full `npm run test:coverage` needs more
 # than 15 minutes on its runner passes a larger value; omit it and the job keeps the 15 minutes it always had.
@@ -601,6 +602,9 @@ jobs:
           read -r -a files <<<"$ALWAYS_RUN"
           # A blank value would leave no argument, and `vitest run` with none runs the whole suite: refuse instead.
           [ "${#files[@]}" -gt 0 ] || { echo "::error::always-run is blank (whitespace only)"; exit 1; }
+          # Each name must be a file, from this step's directory (the job's working-directory, vitest's root): vitest exits 1 only when NO
+          # name matches, and drops a non-matching name silently when another matches (vitest 4.1.2, measured 2026-11-21).
+          for f in "${files[@]}"; do [ -f "$f" ] || { echo "::error::always-run: $f is not a file in $PWD"; exit 1; }; done
           npx vitest run "${files[@]}"
       - run: npm run test:coverage
         if: ${{ inputs.test-command == '' && !(inputs.changed-only && github.event_name == 'pull_request') }}
