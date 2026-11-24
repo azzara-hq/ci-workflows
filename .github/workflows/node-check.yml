@@ -26,7 +26,7 @@
 # `postgres-after-install: true` (off by default; only with `postgres: true`): the `services:` container of a job always starts before its
 # first step, so it is up while `npm ci` runs; on a runner whose memory cap `npm ci` barely fits (the immo row of the CI box, 2.5 GiB) the two
 # together can get npm OOM-killed. With this input the service starts nothing (its image is empty, as when `postgres` is false) and, right after
-# `npm ci` and "Save node_modules", a step runs `docker run -d` of postgres:16 (name node-check-pg-<run id>-<attempt>, the same user, password and
+# `npm ci` and "Save node_modules", a step pulls postgres:16 (three tries) and runs `docker run -d` of it (name node-check-pg-<run id>-<attempt>, the same user, password and
 # database as the service, published on 127.0.0.1:5432 as the service is), then waits up to 60 s for `pg_isready` over TCP and a `select 1`, and fails
 # the job when the database does not answer; a last step with `if: always()` runs `docker rm -f` on it. It needs the `docker` CLI and a reachable
 # daemon in the job's steps (a runner row of kind docker has both; the same need as the `services:` path). DATABASE_URL and NODE_CHECK_POSTGRES are
@@ -228,6 +228,12 @@ jobs:
         run: |
           set -euo pipefail
           name="node-check-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Docker Hub can fail one request: the pull, and only the pull, is tried three times.
+          for try in 1 2 3; do
+            if docker image inspect postgres:16 >/dev/null 2>&1 || docker pull -q postgres:16 >/dev/null; then break; fi
+            if [ "$try" = 3 ]; then echo "::error::postgres:16 could not be pulled (3 tries)"; exit 1; fi
+            sleep 10
+          done
           docker run -d --name "$name" -e POSTGRES_USER=check -e POSTGRES_PASSWORD=check -e POSTGRES_DB=check -p 127.0.0.1:5432:5432 postgres:16 >/dev/null
           # -h 127.0.0.1: the image's init server listens on its socket only, so a TCP answer means the real server is up.
           for i in $(seq 1 30); do
