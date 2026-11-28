@@ -198,6 +198,10 @@ jobs:
         run: |
           git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
           git config --global --add url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "https://github.com/"
+      # Always runs, before the cache: a node_modules cache hit skips `npm ci`, so a package.json that disagrees with its
+      # package-lock.json went unnoticed (immo-plateforme PR #345 d76c7085 is the measured case). Reads the two files only.
+      - name: package.json and package-lock.json agree
+        run: npm ls --package-lock-only
       - name: node_modules cache key
         if: inputs.node-modules-cache
         id: nm-key
